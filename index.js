@@ -39,6 +39,7 @@ function Hyperdrive (storage, key, opts) {
   this.content = opts.content || null
   this.maxRequests = opts.maxRequests || 16
   this.readable = true
+  this.latest = !!opts.latest
 
   this.storage = storage // TODO: do something smarter (this is polymorphic)
   this.tree = tree(this.metadata, {offset: 1, valueEncoding: messages.Stat})
@@ -216,40 +217,52 @@ Hyperdrive.prototype.createWriteStream = function (name, opts) {
     if (proxy.destroyed) return
 
     self._lock(function (release) {
-      if (proxy.destroyed) return release()
+      if (!self.latest || proxy.destroyed) return append(null)
 
-      // No one should mutate the content other than us
-      var byteOffset = self.content.byteLength
-      var offset = self.content.length
-
-      self.emit('append', name, opts)
-
-      // TODO: revert the content feed if this fails!!!! (add an option to the write stream for this (atomic: true))
-      var stream = self.content.createWriteStream()
-
-      proxy.on('close', done)
-      proxy.on('finish', done)
-
-      proxy.setWritable(stream)
-      proxy.on('prefinish', function () {
-        var st = {
-          mode: (opts.mode || DEFAULT_FMODE) | stat.IFREG,
-          uid: opts.uid || 0,
-          gid: opts.gid || 0,
-          size: self.content.byteLength - byteOffset,
-          blocks: self.content.length - offset,
-          offset: offset,
-          byteOffset: byteOffset,
-          mtime: getTime(opts.mtime),
-          ctime: getTime(opts.ctime)
-        }
-
-        proxy.cork()
-        self.tree.put(name, st, function (err) {
-          if (err) return proxy.destroy(err)
-          proxy.uncork()
-        })
+      self.tree.get(name, function (err, st) {
+        if (err && err.notFound) return append(null)
+        if (err) return append(err)
+        if (!st.size) return append(null)
+        self.content.clear(st.offset, st.offset + st.blocks, append)
       })
+
+      function append (err) {
+        if (err) proxy.destroy(err)
+        if (proxy.destroyed) return release()
+
+        // No one should mutate the content other than us
+        var byteOffset = self.content.byteLength
+        var offset = self.content.length
+
+        self.emit('append', name, opts)
+
+        // TODO: revert the content feed if this fails!!!! (add an option to the write stream for this (atomic: true))
+        var stream = self.content.createWriteStream()
+
+        proxy.on('close', done)
+        proxy.on('finish', done)
+
+        proxy.setWritable(stream)
+        proxy.on('prefinish', function () {
+          var st = {
+            mode: (opts.mode || DEFAULT_FMODE) | stat.IFREG,
+            uid: opts.uid || 0,
+            gid: opts.gid || 0,
+            size: self.content.byteLength - byteOffset,
+            blocks: self.content.length - offset,
+            offset: offset,
+            byteOffset: byteOffset,
+            mtime: getTime(opts.mtime),
+            ctime: getTime(opts.ctime)
+          }
+
+          proxy.cork()
+          self.tree.put(name, st, function (err) {
+            if (err) return proxy.destroy(err)
+            proxy.uncork()
+          })
+        })
+      }
 
       function done () {
         proxy.removeListener('close', done)
